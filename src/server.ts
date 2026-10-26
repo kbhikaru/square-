@@ -15,6 +15,7 @@ const handler = createHandler(app, {
   adminPassword: config.adminPassword,
   webhookUrl: webhookUrl(),
   webhookSignatureKey: config.square.webhookSignatureKey,
+  defaultStoreCalendarId: config.google.defaultStoreCalendarId,
 });
 
 createServer((req, res) => void handler(req, res)).listen(config.port, () => {
@@ -26,7 +27,7 @@ createServer((req, res) => void handler(req, res)).listen(config.port, () => {
 // 定期同期（Webhookの取りこぼし対策も兼ねる）
 if (config.sync.intervalMinutes > 0) {
   const tick = async () => {
-    if (!app.store.getGoogleAccount() || !config.square.accessToken) return;
+    if (!config.square.accessToken) return;
     const summary = await app.sync.syncRange("scheduled");
     console.log(`[sync] ${formatSummary(summary)}`);
   };

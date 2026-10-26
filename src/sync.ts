@@ -1,65 +1,98 @@
 import { createHash } from "node:crypto";
-import type { Store } from "./db.ts";
-import type { CalendarApi, CalendarEvent } from "./google.ts";
-import { teamMemberName, type ScheduledShift, type SquareClient, type TeamMember } from "./square.ts";
+import { COMPANY, staffKey, type AccountKey, type EventTarget, type ShiftEventRow, type Store } from "./db.ts";
+import { GoogleAccountUnavailableError, type CalendarEvent, type CalendarGateway } from "./google.ts";
+import { teamMemberName, type ScheduledShift, type ScheduledShiftDetails, type SquareClient, type TeamMember } from "./square.ts";
 
 export type SyncSettings = {
   daysAhead: number;
   defaultTimezone: string;
   titlePrefix: string;
   locationIds: string[];
+  /** 店舗ごとの設定が無い場合に使う、会社アカウント内のカレンダー */
+  defaultStoreCalendarId: string;
 };
 
-export type SyncResult = "created" | "updated" | "unchanged" | "deleted" | "skipped" | "no_email" | "error";
+export type TargetResult = "created" | "updated" | "unchanged" | "deleted" | "no_email" | "error";
+export type ShiftResult = Partial<Record<EventTarget, TargetResult>>;
 
-export type SyncSummary = Record<SyncResult, number> & { total: number; errors: string[] };
+export type SyncSummary = Record<TargetResult, number> & { shifts: number; errors: string[] };
+
+type SquareApi = Pick<SquareClient, "searchPublishedShifts" | "getScheduledShift" | "listTeamMembers" | "listLocations" | "listJobs">;
 
 type Lookups = {
   members: Map<string, TeamMember>;
   locations: Map<string, string>;
   jobs: Map<string, string>;
   overrides: Map<string, string>;
+  locationCalendars: Map<string, string>;
+  linkedStaff: Set<string>;
+  companyLinked: boolean;
 };
 
-/** SquareのシフトIDから、Googleカレンダーの予定IDを決める（a-v,0-9のみ使用可） */
-export function eventIdForShift(shiftId: string): string {
-  return "sq" + createHash("sha256").update(shiftId).digest("hex").slice(0, 40);
+/** 書き込み先1か所ぶんの「あるべき姿」 */
+type Desired = { account: AccountKey; calendarId: string; event: CalendarEvent; attendeeEmail: string | null };
+
+const TARGETS: EventTarget[] = ["store", "staff"];
+
+/**
+ * SquareのシフトIDから、Googleカレンダーの予定IDを決める（a-v,0-9のみ使用可）。
+ * 店舗用とスタッフ用でIDを分ける（招待のコピーとIDが衝突しないように）
+ */
+export function eventIdForShift(shiftId: string, target: EventTarget = "store"): string {
+  const seed = target === "store" ? shiftId : `staff:${shiftId}`;
+  return (target === "store" ? "sq" : "sqs") + createHash("sha256").update(seed).digest("hex").slice(0, 40);
 }
 
-/** シフトの公開内容から、カレンダー予定を組み立てる（純粋関数） */
-export function buildEvent(args: {
+type EventContext = {
   shift: ScheduledShift;
-  email: string;
   member: TeamMember | undefined;
   locationName: string | undefined;
   jobTitle: string | undefined;
   settings: Pick<SyncSettings, "defaultTimezone" | "titlePrefix">;
-}): CalendarEvent & { id: string } {
-  const d = args.shift.published_shift_details!;
-  const tz = d.timezone || args.settings.defaultTimezone;
-  const name = teamMemberName(args.member);
-  const titleParts = [args.locationName, args.jobTitle].filter(Boolean);
+};
 
+function baseEvent(c: EventContext, target: EventTarget, summary: string): CalendarEvent {
+  const d = c.shift.published_shift_details!;
+  const tz = d.timezone || c.settings.defaultTimezone;
+  const name = teamMemberName(c.member);
   const description = [
     name && `スタッフ: ${name}`,
-    args.locationName && `店舗: ${args.locationName}`,
-    args.jobTitle && `職種: ${args.jobTitle}`,
+    c.locationName && `店舗: ${c.locationName}`,
+    c.jobTitle && `職種: ${c.jobTitle}`,
     d.notes && `メモ: ${d.notes}`,
     "",
     "※ Squareのシフトから自動作成された予定です。変更はSquare側で行ってください。",
   ]
     .filter((l): l is string => typeof l === "string")
     .join("\n");
-
   return {
-    id: eventIdForShift(args.shift.id),
-    summary: `${args.settings.titlePrefix}${titleParts.join(" / ") || "勤務"}`,
+    id: eventIdForShift(c.shift.id, target),
+    summary,
     description,
-    location: args.locationName,
+    location: c.locationName,
     start: { dateTime: d.start_at!, timeZone: tz },
     end: { dateTime: d.end_at!, timeZone: tz },
-    attendees: [{ email: args.email, ...(name ? { displayName: name } : {}) }],
-    extendedProperties: { private: { squareShiftId: args.shift.id } },
+    extendedProperties: { private: { squareShiftId: c.shift.id } },
+  };
+}
+
+/** スタッフ本人のカレンダー用：タイトルは「店舗 / 職種」 */
+export function buildStaffEvent(c: EventContext): CalendarEvent {
+  const title = [c.locationName, c.jobTitle].filter(Boolean).join(" / ") || "勤務";
+  return baseEvent(c, "staff", `${c.settings.titlePrefix}${title}`);
+}
+
+/**
+ * 店舗カレンダー用：誰のシフトか分かるようにタイトルはスタッフ名。
+ * inviteEmail があれば（本人がGoogle未連携の場合）招待も送る
+ */
+export function buildStoreEvent(c: EventContext & { inviteEmail: string | null }): CalendarEvent {
+  const name = teamMemberName(c.member) || "スタッフ";
+  const title = c.jobTitle ? `${name}（${c.jobTitle}）` : name;
+  const ev = baseEvent(c, "store", `${c.settings.titlePrefix}${title}`);
+  return {
+    ...ev,
+    attendees: c.inviteEmail ? [{ email: c.inviteEmail, ...(teamMemberName(c.member) ? { displayName: teamMemberName(c.member) } : {}) }] : [],
     guestsCanModify: false,
     guestsCanInviteOthers: false,
   };
@@ -67,42 +100,41 @@ export function buildEvent(args: {
 
 export function hashEvent(e: CalendarEvent): string {
   return createHash("sha256")
-    .update(JSON.stringify([e.summary, e.description, e.location, e.start, e.end, e.attendees]))
+    .update(JSON.stringify([e.summary, e.description, e.location, e.start, e.end, e.attendees ?? []]))
     .digest("hex");
 }
 
 function emptySummary(): SyncSummary {
-  return { created: 0, updated: 0, unchanged: 0, deleted: 0, skipped: 0, no_email: 0, error: 0, total: 0, errors: [] };
+  return { created: 0, updated: 0, unchanged: 0, deleted: 0, no_email: 0, error: 0, shifts: 0, errors: [] };
 }
 
 export function formatSummary(s: SyncSummary): string {
   const parts = [
-    `対象${s.total}件`,
+    `シフト${s.shifts}件`,
     `新規${s.created}`,
     `更新${s.updated}`,
     `変更なし${s.unchanged}`,
     `削除${s.deleted}`,
-    `メール未登録${s.no_email}`,
+    `送信先なし${s.no_email}`,
     `エラー${s.error}`,
   ];
   return parts.join(" / ") + (s.errors.length ? `\n${s.errors.slice(0, 5).join("\n")}` : "");
 }
 
+function isLive(row: ShiftEventRow | null): row is ShiftEventRow & { eventId: string; accountKey: AccountKey; calendarId: string } {
+  return Boolean(row?.eventId && row.accountKey && row.calendarId && (row.status === "synced" || row.status === "error"));
+}
+
 export class SyncService {
   private readonly store: Store;
-  private readonly square: Pick<SquareClient, "searchPublishedShifts" | "getScheduledShift" | "listTeamMembers" | "listLocations" | "listJobs">;
-  private readonly calendar: () => CalendarApi;
+  private readonly square: SquareApi;
+  private readonly calendar: CalendarGateway;
   private readonly settings: SyncSettings;
-  private lookupsCache: { at: number; value: Omit<Lookups, "overrides"> } | null = null;
+  private cache: { at: number; value: Pick<Lookups, "members" | "locations" | "jobs"> } | null = null;
   private queue: Promise<unknown> = Promise.resolve();
-  private readonly lastErrors = new Map<string, string>();
+  private errors: string[] = [];
 
-  constructor(opts: {
-    store: Store;
-    square: SyncService["square"];
-    calendar: () => CalendarApi;
-    settings: SyncSettings;
-  }) {
+  constructor(opts: { store: Store; square: SquareApi; calendar: CalendarGateway; settings: SyncSettings }) {
     this.store = opts.store;
     this.square = opts.square;
     this.calendar = opts.calendar;
@@ -117,26 +149,31 @@ export class SyncService {
   }
 
   private async lookups(forceRefresh = false): Promise<Lookups> {
-    const fresh = this.lookupsCache && Date.now() - this.lookupsCache.at < 5 * 60_000;
+    const fresh = this.cache && Date.now() - this.cache.at < 5 * 60_000;
     if (!fresh || forceRefresh) {
       const [memberList, locations, jobs] = await Promise.all([
         this.square.listTeamMembers(),
         this.square.listLocations(),
         this.square.listJobs(),
       ]);
-      this.lookupsCache = {
-        at: Date.now(),
-        value: { members: new Map(memberList.map((m) => [m.id, m])), locations, jobs },
-      };
+      this.cache = { at: Date.now(), value: { members: new Map(memberList.map((m) => [m.id, m])), locations, jobs } };
     }
-    return { ...this.lookupsCache!.value, overrides: this.store.getEmailOverrides() };
+    const linkedStaff = new Set<string>();
+    for (const [id, a] of this.store.listStaffAccounts()) if (!a.invalid) linkedStaff.add(id);
+    return {
+      ...this.cache!.value,
+      overrides: this.store.getEmailOverrides(),
+      locationCalendars: this.store.getLocationCalendars(),
+      linkedStaff,
+      companyLinked: Boolean(this.store.getActiveGoogleAccount(COMPANY)),
+    };
   }
 
   /** 期間内の公開済みシフトをまとめて同期 */
   syncRange(trigger: string, now = new Date()): Promise<SyncSummary> {
     return this.exclusive(async () => {
       const runId = this.store.startSyncRun(trigger);
-      this.lastErrors.clear();
+      this.errors = [];
       const summary = emptySummary();
       try {
         const from = new Date(now.getTime() - 24 * 3600_000).toISOString();
@@ -149,105 +186,185 @@ export class SyncService {
         const seen = new Set<string>();
         for (const shift of shifts) {
           seen.add(shift.id);
-          count(summary, await this.syncOne(shift.id, shift, lk), shift.id);
+          tally(summary, await this.syncOne(shift.id, shift, lk));
         }
-
         // 以前同期したのに今回の検索結果に無いシフト（削除・期間外移動など）を個別に確認
-        for (const row of this.store.listActiveShiftEventsBetween(from, to)) {
-          if (seen.has(row.shiftId)) continue;
-          const shift = await this.square.getScheduledShift(row.shiftId);
-          count(summary, await this.syncOne(row.shiftId, shift, lk), row.shiftId);
+        for (const shiftId of this.store.listLiveShiftIdsBetween(from, to)) {
+          if (seen.has(shiftId)) continue;
+          tally(summary, await this.syncOne(shiftId, await this.square.getScheduledShift(shiftId), lk));
         }
       } catch (e) {
         summary.error++;
-        summary.errors.push(errorMessage(e));
+        this.errors.unshift(errorMessage(e));
       }
-      for (const [id, msg] of this.lastErrors) summary.errors.push(`${id}: ${msg}`);
-      this.lastErrors.clear();
+      summary.errors = this.errors;
       this.store.finishSyncRun(runId, formatSummary(summary));
       return summary;
     });
   }
 
   /** 1件だけ同期（Webhook用）。shiftを渡さない場合はSquareから取得する */
-  syncShiftById(shiftId: string, shift?: ScheduledShift | null): Promise<SyncResult> {
+  syncShiftById(shiftId: string, shift?: ScheduledShift | null): Promise<ShiftResult> {
     return this.exclusive(async () => {
       const s = shift === undefined ? await this.square.getScheduledShift(shiftId) : shift;
       return this.syncOne(shiftId, s, await this.lookups());
     });
   }
 
-  private async syncOne(shiftId: string, shift: ScheduledShift | null, lk: Lookups): Promise<SyncResult> {
-    const existing = this.store.getShiftEvent(shiftId);
-    const d = shift?.published_shift_details;
-    // error の場合も予定が残っている可能性があるので「生きている」扱い
-    const hasLiveEvent = Boolean(existing?.eventId && (existing.status === "synced" || existing.status === "error"));
-
-    try {
-      // シフトが削除された／未公開／担当者なし → 予定があれば削除
-      if (!shift || !d || d.is_deleted || !d.team_member_id || !d.start_at || !d.end_at) {
-        if (hasLiveEvent) {
-          await this.calendar().deleteEvent(existing!.eventId!);
-          this.store.upsertShiftEvent({
-            ...existing!,
-            status: "deleted",
-            contentHash: null,
-            message: shift ? "シフトが削除または担当者なしになりました" : "Squareにシフトが存在しません",
-          });
-          return "deleted";
+  /**
+   * スタッフが連携を解除する前に、本人のカレンダーから今後のシフト予定を消す。
+   * （解除後は本人のカレンダーを操作できなくなるため）
+   */
+  removeStaffEvents(teamMemberId: string, now = new Date()): Promise<number> {
+    return this.exclusive(async () => {
+      let removed = 0;
+      for (const row of this.store.listLiveStaffEvents(teamMemberId, now.toISOString())) {
+        try {
+          await this.calendar.deleteEvent(row.accountKey!, row.calendarId!, row.eventId!);
+        } catch (e) {
+          if (!(e instanceof GoogleAccountUnavailableError)) throw e;
         }
-        return "skipped";
+        this.store.upsertShiftEvent({ ...row, status: "deleted", contentHash: null, message: "Google連携の解除により削除" });
+        removed++;
       }
+      return removed;
+    });
+  }
 
-      const member = lk.members.get(d.team_member_id);
-      const email = (lk.overrides.get(d.team_member_id) ?? member?.email_address ?? "").trim();
+  private async syncOne(shiftId: string, shift: ScheduledShift | null, lk: Lookups): Promise<ShiftResult> {
+    const d = shift?.published_shift_details;
+    const active = Boolean(shift && d && !d.is_deleted && d.team_member_id && d.start_at && d.end_at);
+    const desired = active ? this.desiredTargets(shift!, d!, lk) : { store: null, staff: null };
 
-      if (!email) {
-        // 担当者がメール未登録のスタッフに変わった場合、前の担当者の予定は消す
-        if (hasLiveEvent) await this.calendar().deleteEvent(existing!.eventId!);
-        this.store.upsertShiftEvent({
-          shiftId,
-          eventId: existing?.eventId ?? null,
-          teamMemberId: d.team_member_id,
-          attendeeEmail: null,
-          contentHash: null,
-          status: "no_email",
-          message: `${teamMemberName(member) || d.team_member_id} のメールアドレスが未登録です`,
-          startAt: d.start_at,
-        });
-        return "no_email";
-      }
+    const result: ShiftResult = {};
+    for (const target of TARGETS) {
+      const reason = !shift
+        ? "Squareにシフトが存在しません"
+        : !active
+          ? "シフトが削除または担当者なしになりました"
+          : target === "staff"
+            ? "本人のGoogle連携がないため"
+            : "店舗カレンダーの書き込み先がないため";
+      const r = await this.reconcile(shiftId, target, desired[target], d, reason);
+      if (r) result[target] = r;
+    }
 
-      const event = buildEvent({
-        shift,
-        email,
-        member,
-        locationName: d.location_id ? lk.locations.get(d.location_id) : undefined,
-        jobTitle: d.job_id ? lk.jobs.get(d.job_id) : undefined,
-        settings: this.settings,
-      });
-      const hash = hashEvent(event);
-      if (existing?.status === "synced" && existing.contentHash === hash) return "unchanged";
-
-      await this.calendar().upsertEvent(event);
+    // 本人未連携かつメールも無い → どこにも届かないことを記録
+    if (active && result.staff !== "error" && !lk.linkedStaff.has(d!.team_member_id!) && !this.inviteEmailFor(d!.team_member_id!, lk)) {
+      const member = lk.members.get(d!.team_member_id!);
       this.store.upsertShiftEvent({
         shiftId,
-        eventId: event.id,
-        teamMemberId: d.team_member_id,
-        attendeeEmail: email,
+        target: "staff",
+        accountKey: null,
+        calendarId: null,
+        eventId: null,
+        teamMemberId: d!.team_member_id!,
+        attendeeEmail: null,
+        contentHash: null,
+        status: "no_email",
+        message: `${teamMemberName(member) || d!.team_member_id} はGoogle未連携で、メールアドレスも未登録です`,
+        startAt: d!.start_at!,
+      });
+      result.staff = "no_email";
+    }
+    return result;
+  }
+
+  private inviteEmailFor(teamMemberId: string, lk: Lookups): string | null {
+    return (lk.overrides.get(teamMemberId) ?? lk.members.get(teamMemberId)?.email_address ?? "").trim() || null;
+  }
+
+  private desiredTargets(shift: ScheduledShift, d: ScheduledShiftDetails, lk: Lookups): Record<EventTarget, Desired | null> {
+    const tmId = d.team_member_id!;
+    const ctx: EventContext = {
+      shift,
+      member: lk.members.get(tmId),
+      locationName: d.location_id ? lk.locations.get(d.location_id) : undefined,
+      jobTitle: d.job_id ? lk.jobs.get(d.job_id) : undefined,
+      settings: this.settings,
+    };
+    const staffLinked = lk.linkedStaff.has(tmId);
+
+    // スタッフ本人のカレンダー（本人がGoogle連携済みの場合のみ）
+    const staff: Desired | null = staffLinked
+      ? { account: staffKey(tmId), calendarId: "primary", event: buildStaffEvent(ctx), attendeeEmail: null }
+      : null;
+
+    // 店舗カレンダー（会社アカウント）。本人未連携ならここから招待を送る
+    const calendarId = d.location_id && lk.locationCalendars.has(d.location_id)
+      ? lk.locationCalendars.get(d.location_id)!
+      : this.settings.defaultStoreCalendarId;
+    let store: Desired | null = null;
+    if (lk.companyLinked && calendarId) {
+      const inviteEmail = staffLinked ? null : this.inviteEmailFor(tmId, lk);
+      store = { account: COMPANY, calendarId, event: buildStoreEvent({ ...ctx, inviteEmail }), attendeeEmail: inviteEmail };
+    }
+    return { store, staff };
+  }
+
+  /** 1か所（店舗 or 本人）の予定を、あるべき姿に合わせる */
+  private async reconcile(
+    shiftId: string,
+    target: EventTarget,
+    want: Desired | null,
+    d: ScheduledShiftDetails | undefined,
+    removalReason: string,
+  ): Promise<TargetResult | null> {
+    const existing = this.store.getShiftEvent(shiftId, target);
+    const live = isLive(existing);
+    const samePlace = live && want && existing.accountKey === want.account && existing.calendarId === want.calendarId;
+    // 予定が今どこにあるか（エラー時の記録用）
+    let current: { account: AccountKey | null; calendarId: string | null; eventId: string | null } = live
+      ? { account: existing.accountKey, calendarId: existing.calendarId, eventId: existing.eventId }
+      : { account: null, calendarId: null, eventId: null };
+
+    try {
+      // 不要になった／場所が変わった予定を消す
+      if (live && !samePlace) {
+        await this.deleteQuietly(existing.accountKey, existing.calendarId, existing.eventId);
+        current = { account: null, calendarId: null, eventId: null };
+        if (!want) {
+          this.store.upsertShiftEvent({ ...existing, status: "deleted", contentHash: null, message: removalReason });
+          return "deleted";
+        }
+      }
+      if (!want) {
+        // 予定は無いが「送信先なし」などの記録が残っている場合は片付ける
+        if (existing && existing.status !== "deleted") {
+          this.store.upsertShiftEvent({ ...existing, status: "deleted", eventId: existing.eventId, contentHash: null, message: removalReason });
+        }
+        return null;
+      }
+
+      const hash = hashEvent(want.event);
+      if (samePlace && existing.status === "synced" && existing.contentHash === hash) return "unchanged";
+
+      current = { account: want.account, calendarId: want.calendarId, eventId: want.event.id };
+      await this.calendar.upsertEvent(want.account, want.calendarId, want.event);
+      this.store.upsertShiftEvent({
+        shiftId,
+        target,
+        accountKey: want.account,
+        calendarId: want.calendarId,
+        eventId: want.event.id,
+        teamMemberId: d?.team_member_id ?? null,
+        attendeeEmail: want.attendeeEmail,
         contentHash: hash,
         status: "synced",
         message: null,
-        startAt: d.start_at,
+        startAt: d?.start_at ?? null,
       });
-      return hasLiveEvent ? "updated" : "created";
+      return samePlace ? "updated" : "created";
     } catch (e) {
       const msg = errorMessage(e);
-      this.lastErrors.set(shiftId, msg);
-      // 予定IDは残し、ハッシュを消して次回に再試行させる
+      this.errors.push(`${shiftId}(${target === "store" ? "店舗" : "本人"}): ${msg}`);
+      // ハッシュを消して次回に再試行させる
       this.store.upsertShiftEvent({
         shiftId,
-        eventId: existing?.eventId ?? null,
+        target,
+        accountKey: current.account,
+        calendarId: current.calendarId,
+        eventId: current.eventId,
         teamMemberId: d?.team_member_id ?? existing?.teamMemberId ?? null,
         attendeeEmail: existing?.attendeeEmail ?? null,
         contentHash: null,
@@ -258,11 +375,20 @@ export class SyncService {
       return "error";
     }
   }
+
+  /** 連携が切れていて消せない場合は諦める（本人のカレンダーにはアクセスできない） */
+  private async deleteQuietly(account: AccountKey, calendarId: string, eventId: string): Promise<void> {
+    try {
+      await this.calendar.deleteEvent(account, calendarId, eventId);
+    } catch (e) {
+      if (!(e instanceof GoogleAccountUnavailableError)) throw e;
+    }
+  }
 }
 
-function count(summary: SyncSummary, result: SyncResult, _shiftId: string): void {
-  summary[result]++;
-  if (result !== "skipped") summary.total++;
+function tally(summary: SyncSummary, r: ShiftResult): void {
+  summary.shifts++;
+  for (const v of Object.values(r)) if (v) summary[v]++;
 }
 
 function errorMessage(e: unknown): string {

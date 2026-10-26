@@ -37,7 +37,8 @@ export const config = {
   google: {
     clientId: str("GOOGLE_CLIENT_ID"),
     clientSecret: str("GOOGLE_CLIENT_SECRET"),
-    calendarId: str("GOOGLE_CALENDAR_ID", "primary"),
+    // 店舗ごとの割り当てが無い場合に使う、会社アカウント内のカレンダーID（空なら書き込まない）
+    defaultStoreCalendarId: str("STORE_CALENDAR_ID", "primary"),
   },
 
   sync: {
@@ -52,6 +53,10 @@ export type Config = typeof config;
 
 export function googleRedirectUri(): string {
   return `${config.baseUrl}/auth/google/callback`;
+}
+
+export function staffConnectUrl(token: string): string {
+  return `${config.baseUrl}/connect/${token}`;
 }
 
 export function webhookUrl(): string {

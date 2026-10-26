@@ -1,15 +1,18 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { App } from "./app.ts";
-import { verifySquareSignature } from "./square.ts";
+import { COMPANY, staffKey } from "./db.ts";
+import { hasScopes } from "./google.ts";
+import { teamMemberName, verifySquareSignature } from "./square.ts";
 import { formatSummary } from "./sync.ts";
-import { renderDashboard } from "./views.ts";
+import { renderDashboard, renderLinkIssued, renderStaffPage } from "./views.ts";
 
 export type HttpSettings = {
   baseUrl: string;
   adminPassword: string;
   webhookUrl: string;
   webhookSignatureKey: string;
+  defaultStoreCalendarId: string;
 };
 
 const SHIFT_EVENT_TYPES = new Set([
@@ -19,19 +22,50 @@ const SHIFT_EVENT_TYPES = new Set([
   "labor.scheduled_shift.deleted",
 ]);
 
+/** スタッフ用連携リンクの有効期限 */
+const LINK_TTL_MS = 14 * 24 * 3600_000;
+
+export const hashToken = (t: string) => createHash("sha256").update(t).digest("hex");
+
 export function createHandler(app: App, s: HttpSettings) {
   const secureCookie = s.baseUrl.startsWith("https://") ? "; Secure" : "";
+  const stateCookie = (v: string, maxAge: number) =>
+    `oauth_state=${v}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secureCookie}`;
+
+  /** Google認可画面へ送り出す（会社・スタッフ共通） */
+  function startOAuth(res: ServerResponse, purpose: "company" | "staff", teamMemberId: string | null, loginHint?: string) {
+    const state = randomBytes(16).toString("hex");
+    app.store.saveOAuthState(state, { purpose, teamMemberId });
+    res.setHeader("Set-Cookie", stateCookie(state, 900));
+    return redirect(res, app.oauth.authUrl(state, purpose, loginHint));
+  }
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", s.baseUrl);
     const route = `${req.method} ${url.pathname}`;
 
     try {
-      // ---- 認証不要 ----
+      // ================= 認証不要 =================
       if (route === "GET /healthz") return send(res, 200, "ok", "text/plain");
       if (route === "POST /webhooks/square") return await handleWebhook(req, res);
+      if (route === "GET /auth/google/callback") return await handleCallback(req, res, url);
 
-      // ---- ここから管理者のみ ----
+      // スタッフ向け: 連携リンク
+      const connect = url.pathname.match(/^\/connect\/([A-Za-z0-9_-]{20,})(\/start)?$/);
+      if (req.method === "GET" && connect) {
+        const teamMemberId = app.store.findStaffLinkToken(hashToken(connect[1]));
+        if (!teamMemberId) {
+          return send(res, 410, renderStaffPage({ kind: "expired" }), "text/html");
+        }
+        const member = (await app.square.listTeamMembers().catch(() => [])).find((m) => m.id === teamMemberId);
+        if (!connect[2]) {
+          return send(res, 200, renderStaffPage({ kind: "landing", name: teamMemberName(member), startUrl: `${url.pathname}/start` }), "text/html");
+        }
+        if (!app.oauth.configured) return send(res, 503, "Google連携が設定されていません", "text/plain");
+        return startOAuth(res, "staff", teamMemberId, member?.email_address ?? undefined);
+      }
+
+      // ================= ここから管理者のみ =================
       if (!isAdmin(req, s.adminPassword)) {
         res.setHeader("WWW-Authenticate", 'Basic realm="Shift Calendar Admin", charset="UTF-8"');
         return send(res, 401, "認証が必要です", "text/plain");
@@ -39,6 +73,7 @@ export function createHandler(app: App, s: HttpSettings) {
       if (req.method === "POST" && !isSameOrigin(req, s.baseUrl)) {
         return send(res, 403, "不正なリクエスト元です", "text/plain");
       }
+      const form = req.method === "POST" ? new URLSearchParams(await readBody(req)) : new URLSearchParams();
 
       switch (route) {
         case "GET /": {
@@ -46,63 +81,117 @@ export function createHandler(app: App, s: HttpSettings) {
             flash: url.searchParams.get("msg"),
             webhookUrl: s.webhookUrl,
             webhookEnabled: Boolean(s.webhookSignatureKey),
+            defaultStoreCalendarId: s.defaultStoreCalendarId,
           });
           return send(res, 200, html, "text/html");
         }
 
         case "GET /auth/google": {
-          if (!app.oauth.configured) return redirect(res, "/?msg=" + enc("GOOGLE_CLIENT_ID / SECRET を設定してください"));
-          const state = randomBytes(16).toString("hex");
-          res.setHeader("Set-Cookie", `oauth_state=${state}; HttpOnly; SameSite=Lax; Path=/auth/google; Max-Age=600${secureCookie}`);
-          return redirect(res, app.oauth.authUrl(state));
-        }
-
-        case "GET /auth/google/callback": {
-          const state = url.searchParams.get("state") ?? "";
-          const cookieState = parseCookies(req.headers.cookie).oauth_state ?? "";
-          res.setHeader("Set-Cookie", `oauth_state=; HttpOnly; Path=/auth/google; Max-Age=0${secureCookie}`);
-          if (url.searchParams.get("error")) return redirect(res, "/?msg=" + enc(`Google連携がキャンセルされました（${url.searchParams.get("error")}）`));
-          if (!state || !safeEqual(state, cookieState)) return redirect(res, "/?msg=" + enc("連携に失敗しました（state不一致）。もう一度お試しください"));
-          const code = url.searchParams.get("code");
-          if (!code) return redirect(res, "/?msg=" + enc("認可コードがありません"));
-
-          const tokens = await app.oauth.exchangeCode(code);
-          app.store.saveGoogleAccount(tokens);
-          return redirect(res, "/?msg=" + enc(`Googleアカウント ${tokens.email} と連携しました`));
+          if (!app.oauth.configured) return back(res, "GOOGLE_CLIENT_ID / SECRET を設定してください");
+          return startOAuth(res, "company", null);
         }
 
         case "POST /auth/google/disconnect": {
-          const account = app.store.getGoogleAccount();
+          const account = app.store.getGoogleAccount(COMPANY);
           if (account) await app.oauth.revoke(account.refreshToken);
-          app.store.deleteGoogleAccount();
-          return redirect(res, "/?msg=" + enc("Googleアカウントの連携を解除しました"));
+          app.store.deleteGoogleAccount(COMPANY);
+          return back(res, "会社アカウントの連携を解除しました");
         }
 
         case "POST /sync": {
-          if (!app.store.getGoogleAccount()) return redirect(res, "/?msg=" + enc("先にGoogleアカウントを連携してください"));
           const summary = await app.sync.syncRange("manual");
-          return redirect(res, "/?msg=" + enc(`同期しました: ${formatSummary(summary)}`));
+          return back(res, `同期しました: ${formatSummary(summary)}`);
+        }
+
+        case "POST /locations/calendar": {
+          const locationId = form.get("location_id") ?? "";
+          const value = form.get("calendar_id") ?? "__default__";
+          if (!locationId) return back(res, "店舗IDがありません");
+          // "__default__" = 既定に戻す, "__none__" = 書き込まない, それ以外 = カレンダーID
+          app.store.setLocationCalendar(locationId, value === "__default__" ? null : value === "__none__" ? "" : value);
+          return back(res, "店舗カレンダーの割り当てを保存しました（次回同期から反映）");
         }
 
         case "POST /staff/email": {
-          const form = new URLSearchParams(await readBody(req));
           const teamMemberId = form.get("team_member_id") ?? "";
           const email = (form.get("email") ?? "").trim();
-          if (!teamMemberId) return redirect(res, "/?msg=" + enc("スタッフIDがありません"));
+          if (!teamMemberId) return back(res, "スタッフIDがありません");
           if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-            return redirect(res, "/?msg=" + enc(`メールアドレスの形式が正しくありません: ${email}`));
+            return back(res, `メールアドレスの形式が正しくありません: ${email}`);
           }
           app.store.setEmailOverride(teamMemberId, email || null);
-          return redirect(res, "/?msg=" + enc(email ? `招待先を ${email} に設定しました（次回同期から反映）` : "招待先の上書きを解除しました"));
+          return back(res, email ? `招待先を ${email} に設定しました（次回同期から反映）` : "招待先の上書きを解除しました");
+        }
+
+        case "POST /staff/link": {
+          const teamMemberId = form.get("team_member_id") ?? "";
+          if (!teamMemberId) return back(res, "スタッフIDがありません");
+          const token = randomBytes(24).toString("base64url");
+          app.store.saveStaffLinkToken(hashToken(token), teamMemberId, Date.now() + LINK_TTL_MS);
+          const member = (await app.square.listTeamMembers().catch(() => [])).find((m) => m.id === teamMemberId);
+          // リンクはURL履歴に残さないよう、リダイレクトせずこの場で表示する
+          return send(
+            res,
+            200,
+            renderLinkIssued({ name: teamMemberName(member) || teamMemberId, link: `${s.baseUrl}/connect/${token}`, days: LINK_TTL_MS / 86400_000 }),
+            "text/html",
+          );
+        }
+
+        case "POST /staff/disconnect": {
+          const teamMemberId = form.get("team_member_id") ?? "";
+          const account = teamMemberId ? app.store.getGoogleAccount(staffKey(teamMemberId)) : null;
+          if (!account) return back(res, "このスタッフは連携されていません");
+          // 本人のカレンダーから今後のシフト予定を消してから解除（解除後は消せないため）
+          const removed = account.invalid ? 0 : await app.sync.removeStaffEvents(teamMemberId);
+          await app.oauth.revoke(account.refreshToken);
+          app.store.deleteGoogleAccount(staffKey(teamMemberId));
+          return back(res, `${account.email} の連携を解除しました（本人のカレンダーから${removed}件の予定を削除）`);
         }
       }
       return send(res, 404, "Not Found", "text/plain");
     } catch (e) {
       console.error(`[${route}]`, e);
-      if (req.method === "GET" && url.pathname === "/") return send(res, 500, "エラーが発生しました", "text/plain");
-      return redirect(res, "/?msg=" + enc(`エラー: ${e instanceof Error ? e.message : String(e)}`));
+      if (req.method === "GET") return send(res, 500, "エラーが発生しました", "text/plain");
+      return back(res, `エラー: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
+
+  async function handleCallback(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const state = url.searchParams.get("state") ?? "";
+    const cookieState = parseCookies(req.headers.cookie).oauth_state ?? "";
+    res.setHeader("Set-Cookie", stateCookie("", 0));
+
+    // stateがこのブラウザで発行したものか確認（CSRF対策）。DBの記録は1回限り
+    const saved = state && safeEqual(state, cookieState) ? app.store.takeOAuthState(state) : null;
+    if (!saved) {
+      return send(res, 400, renderStaffPage({ kind: "error", message: "連携に失敗しました（state不一致・期限切れ）。もう一度最初からお試しください。" }), "text/html");
+    }
+    const isStaff = saved.purpose === "staff" && saved.teamMemberId;
+    const fail = (message: string) =>
+      isStaff ? send(res, 400, renderStaffPage({ kind: "error", message }), "text/html") : back(res, message);
+
+    if (url.searchParams.get("error")) return fail(`Google連携がキャンセルされました（${url.searchParams.get("error")}）`);
+    const code = url.searchParams.get("code");
+    if (!code) return fail("認可コードがありません");
+
+    const tokens = await app.oauth.exchangeCode(code);
+    if (!hasScopes(tokens.scopes, saved.purpose)) {
+      await app.oauth.revoke(tokens.refreshToken);
+      return fail("カレンダーへのアクセスが許可されませんでした。同意画面ですべての項目にチェックを入れてください。");
+    }
+
+    if (isStaff) {
+      app.store.saveGoogleAccount(staffKey(saved.teamMemberId!), tokens);
+      app.store.deleteStaffLinkTokens(saved.teamMemberId!);
+      // すぐ本人のカレンダーに反映（招待方式からの切り替えも含む）
+      void app.sync.syncRange("staff-linked").catch((e) => console.error("[sync after staff link]", e));
+      return send(res, 200, renderStaffPage({ kind: "done", email: tokens.email }), "text/html");
+    }
+
+    app.store.saveGoogleAccount(COMPANY, tokens);
+    return back(res, `会社アカウント ${tokens.email} と連携しました`);
+  }
 
   async function handleWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const raw = await readBody(req);
@@ -125,12 +214,11 @@ export function createHandler(app: App, s: HttpSettings) {
 
     const shiftId: string | undefined = event?.data?.id;
     if (!SHIFT_EVENT_TYPES.has(event?.type) || !shiftId) return;
-    if (!app.store.getGoogleAccount()) return;
 
     const shift = event.type === "labor.scheduled_shift.deleted" ? null : undefined; // undefined = 最新をSquareから取得
     app.sync
       .syncShiftById(shiftId, shift)
-      .then((r) => console.log(`[webhook] ${event.type} ${shiftId} → ${r}`))
+      .then((r) => console.log(`[webhook] ${event.type} ${shiftId} →`, r))
       .catch((e) => console.error(`[webhook] ${event.type} ${shiftId} failed`, e));
   }
 }
@@ -203,6 +291,7 @@ function redirect(res: ServerResponse, location: string): void {
   res.end();
 }
 
-function enc(s: string): string {
-  return encodeURIComponent(s);
+/** 管理画面に戻ってメッセージを表示 */
+function back(res: ServerResponse, message: string): void {
+  redirect(res, "/?msg=" + encodeURIComponent(message));
 }

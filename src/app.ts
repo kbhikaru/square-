@@ -1,6 +1,6 @@
 import { config, googleRedirectUri } from "./config.ts";
 import { Store } from "./db.ts";
-import { GoogleCalendarClient, GoogleOAuth, getAccessToken } from "./google.ts";
+import { GoogleCalendarGateway, GoogleOAuth, getAccessToken } from "./google.ts";
 import { SquareClient } from "./square.ts";
 import { SyncService } from "./sync.ts";
 
@@ -17,22 +17,20 @@ export function createApp() {
     clientSecret: config.google.clientSecret,
     redirectUri: googleRedirectUri(),
   });
-  const calendar = new GoogleCalendarClient({
-    calendarId: config.google.calendarId,
-    getToken: () => getAccessToken(store, oauth),
-  });
+  const calendar = new GoogleCalendarGateway({ getToken: (key) => getAccessToken(store, oauth, key) });
   const sync = new SyncService({
     store,
     square,
-    calendar: () => calendar,
+    calendar,
     settings: {
       daysAhead: config.sync.daysAhead,
       defaultTimezone: config.sync.defaultTimezone,
       titlePrefix: config.sync.titlePrefix,
       locationIds: config.square.locationIds,
+      defaultStoreCalendarId: config.google.defaultStoreCalendarId,
     },
   });
-  return { store, square, oauth, sync };
+  return { store, square, oauth, calendar, sync };
 }
 
 export type App = ReturnType<typeof createApp>;

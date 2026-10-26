@@ -2,11 +2,7 @@
 import { createApp } from "./app.ts";
 import { formatSummary } from "./sync.ts";
 
-const { store, sync } = createApp();
-if (!store.getGoogleAccount()) {
-  console.error("Googleアカウントが未連携です。先に管理画面から連携してください。");
-  process.exit(1);
-}
+const { sync } = createApp();
 const summary = await sync.syncRange("cli");
 console.log(formatSummary(summary));
 process.exit(summary.error > 0 ? 1 : 0);
