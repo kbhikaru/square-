@@ -14,14 +14,41 @@ function int(name: string, fallback: number): number {
   return n;
 }
 
+/** 動いているサーバー環境を判定し、公開URLと保存先を自動で決める */
+function detectHosting() {
+  const env = process.env;
+  const platform = env.RAILWAY_ENVIRONMENT_NAME || env.RAILWAY_PROJECT_ID
+    ? "Railway"
+    : env.RENDER
+      ? "Render"
+      : env.FLY_APP_NAME
+        ? "Fly.io"
+        : env.K_SERVICE
+          ? "Cloud Run"
+          : "local";
+  const autoBaseUrl = env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${env.RAILWAY_PUBLIC_DOMAIN}`
+    : env.RENDER_EXTERNAL_URL
+      ? env.RENDER_EXTERNAL_URL
+      : env.FLY_APP_NAME
+        ? `https://${env.FLY_APP_NAME}.fly.dev`
+        : `http://localhost:${env.PORT || 3000}`;
+  // 永続ディスク（Railway Volume など）があればそこにDBを置く
+  const volume = env.RAILWAY_VOLUME_MOUNT_PATH || env.DATA_DIR || "";
+  return { platform, autoBaseUrl, volume };
+}
+
+export const hosting = detectHosting();
+
 export const config = {
   port: int("PORT", 3000),
-  baseUrl: str("BASE_URL", "http://localhost:3000").replace(/\/$/, ""),
+  baseUrl: str("BASE_URL", hosting.autoBaseUrl).replace(/\/$/, ""),
   adminPassword: str("ADMIN_PASSWORD"),
-  databasePath: str("DATABASE_PATH", "./data/app.db"),
+  databasePath: str("DATABASE_PATH", hosting.volume ? `${hosting.volume.replace(/\/$/, "")}/app.db` : "./data/app.db"),
 
   square: {
     accessToken: str("SQUARE_ACCESS_TOKEN"),
+    environment: str("SQUARE_ENVIRONMENT", "sandbox") === "production" ? "production" : "sandbox",
     baseUrl:
       str("SQUARE_ENVIRONMENT", "sandbox") === "production"
         ? "https://connect.squareup.com"

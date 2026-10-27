@@ -1,6 +1,7 @@
 import type { App } from "./app.ts";
 import { COMPANY, type EventTarget, type ShiftEventRow, type ShiftEventStatus } from "./db.ts";
 import type { CalendarInfo } from "./google.ts";
+import type { SetupCheck } from "./setup.ts";
 import { teamMemberName, type TeamMember } from "./square.ts";
 
 const STATUS_LABEL: Record<ShiftEventStatus, string> = {
@@ -35,6 +36,7 @@ const STYLE = `
   .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:.8rem; white-space:nowrap; border:1px solid currentColor; }
   .synced, .ok { color:var(--ok); } .no_email, .warn { color:var(--warn); } .deleted { color:var(--muted); } .error { color:var(--err); }
   details summary { cursor:pointer; margin-top:4px; }
+  ul.checks { list-style:none; padding:0; margin:12px 0 0; } ul.checks li { padding:8px 0; border-top:1px solid var(--line); }
   form.inline { display:flex; gap:6px; align-items:center; margin:0; }
   code { background:var(--bg); padding:1px 4px; border-radius:4px; word-break: break-all; }
 `;
@@ -50,7 +52,7 @@ function page(title: string, body: string): string {
 
 export async function renderDashboard(
   app: App,
-  opts: { flash: string | null; webhookUrl: string; webhookEnabled: boolean; defaultStoreCalendarId: string },
+  opts: { flash: string | null; webhookUrl: string; webhookEnabled: boolean; defaultStoreCalendarId: string; setup: SetupCheck[] },
 ): Promise<string> {
   const company = app.store.getGoogleAccount(COMPANY);
   const staffAccounts = app.store.listStaffAccounts();
@@ -88,6 +90,7 @@ export async function renderDashboard(
     `
 <h1>Squareシフト → Googleカレンダー連携</h1>
 ${opts.flash ? `<section class="flash">${esc(opts.flash)}</section>` : ""}
+${renderSetup(opts.setup)}
 
 <section>
   <h2>1. 会社アカウント（店舗カレンダー）</h2>
@@ -201,6 +204,23 @@ ${opts.flash ? `<section class="flash">${esc(opts.flash)}</section>` : ""}
 </section>
 `,
   );
+}
+
+function renderSetup(checks: SetupCheck[]): string {
+  if (!checks.length) return "";
+  const done = checks.every((c) => c.ok || c.optional);
+  return `<section><details${done ? "" : " open"}>
+    <summary><strong>セットアップ状況</strong> ${done ? `<span class="tag ok">完了</span>` : `<span class="tag warn">未完了の項目があります</span>`}</summary>
+    <ul class="checks">
+      ${checks
+        .map(
+          (c) => `<li><span class="${c.ok ? "ok" : c.optional ? "warn" : "error"}">${c.ok ? "✓" : c.optional ? "△" : "✗"}</span> ${esc(c.label)}
+            ${c.detail ? `<div class="muted">${esc(c.detail)}</div>` : ""}
+            ${c.copy ? `<div class="muted">${esc(c.copy.label)}:</div><div class="row"><input value="${esc(c.copy.value)}" readonly onclick="this.select()" style="flex:1"><button type="button" class="secondary" onclick="navigator.clipboard.writeText(this.previousElementSibling.value);this.textContent='コピー済み'">コピー</button></div>` : ""}
+          </li>`,
+        )
+        .join("")}
+    </ul></details></section>`;
 }
 
 function defaultLabel(id: string, calendarName: (id: string) => string): string {

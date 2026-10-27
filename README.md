@@ -30,44 +30,64 @@ Square（シフト公開） ─▶ このサーバー ─┤
 
 ## 必要なもの
 
-- Node.js 22.18 以上（TypeScriptをビルドなしで実行します。実行時の外部ライブラリは不要）
+- サーバー: **[Railway](https://railway.com/)**（推奨・月5ドル程度）。Dockerが動く場所ならどこでも可
 - Squareのアクセストークン（権限: `TIMECARDS_READ`, `EMPLOYEES_READ`, `MERCHANT_PROFILE_READ`）
 - Google Cloud の OAuth クライアント
 
-## セットアップ
+> **Railwayを選んでいる理由**: 常時起動（15分ごとの同期とWebhook受信に必要）、データ保存用ディスク、HTTPSの自動設定、GitHubにpushするだけで自動更新、スマホのブラウザだけで設定できる、の5点がそろっているため。
+> 公開URLや保存先はサーバー側で自動判定するので、`BASE_URL` などの設定は不要です（Render・Fly.io も自動判定に対応）。
 
-### 1. Square
+## セットアップ（スマホのブラウザだけでできます）
 
-1. [Square Developer Dashboard](https://developer.squareup.com/apps) でアプリを作成し、**アクセストークン**を控える
-2. （任意・推奨）Webhooks → サブスクリプションを追加
-   - URL: `https://<あなたのドメイン>/webhooks/square`
-   - イベント: `labor.scheduled_shift.published`, `labor.scheduled_shift.updated`, `labor.scheduled_shift.deleted`
-   - 作成後に表示される **Signature key** を控える
+順番どおりに進めてください。途中で出てくるURLは、管理画面の「セットアップ状況」にコピーボタン付きで表示されます。
+
+### 1. Railway にサーバーを作る
+
+1. [railway.com](https://railway.com/) に GitHub アカウントでログインし、Hobbyプラン（月5ドル）に登録
+2. 「New Project」→「Deploy from GitHub repo」→ このリポジトリを選ぶ
+   - ブランチは `main`（Settings → Source で変更可）。以降 push するたびに自動で更新されます
+3. 作成されたサービスの **Settings**
+   - **Networking** →「Generate Domain」で公開URLを発行（例: `https://xxxx.up.railway.app`）
+   - **Region** →「Southeast Asia（Singapore）」が日本から一番近いです
+4. サービスを長押し（右クリック）→「**Attach Volume**」→ マウント先を **`/data`** にする（連携情報の保存先。これが無いと再起動で消えます）
+5. **Variables** に次を追加（あとで増やしてもOK。変更すると自動で再起動します）
+
+   | 変数 | 値 |
+   | --- | --- |
+   | `ADMIN_PASSWORD` | 管理画面のパスワード（長めのものを） |
+   | `SQUARE_ACCESS_TOKEN` | 手順3で取得 |
+   | `SQUARE_ENVIRONMENT` | `production` |
+   | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | 手順2で取得 |
+   | `SQUARE_WEBHOOK_SIGNATURE_KEY` | 手順3で取得（任意） |
+
+6. 公開URLを開き、ユーザー名 `admin`・パスワード `ADMIN_PASSWORD` でログイン →「セットアップ状況」を確認
 
 ### 2. Google Cloud
 
 1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成
 2. 「APIとサービス」→「ライブラリ」で **Google Calendar API** を有効化
-3. 「OAuth 同意画面」を設定（スコープ: `calendar.events`, `calendar.calendarlist.readonly`）
+3. 「OAuth 同意画面」
+   - ユーザーの種類: **外部**
+   - スコープ: `calendar.events`, `calendar.calendarlist.readonly`
+   - 公開ステータス: **本番環境**（「テスト」のままだと連携が7日で切れます）
 4. 「認証情報」→「OAuth クライアントID」→ 種類 **ウェブアプリケーション**
-   - 承認済みリダイレクトURI: `https://<あなたのドメイン>/auth/google/callback`
-5. クライアントID とシークレットを控える
+   - 承認済みリダイレクトURI: セットアップ状況の「承認済みのリダイレクトURI」をコピーして貼り付け
+5. クライアントID とシークレットを Railway の Variables に設定
 
-> **スタッフが個人のGmailアカウントで連携する場合の注意**
-> - OAuth同意画面の「ユーザーの種類」は **外部** にします。
-> - 「テスト」状態ではテストユーザーに登録した人（最大100人）しか連携できず、連携も7日で切れます。
-> - 「本番環境」に公開すると誰でも連携できますが、カレンダー権限は「機密性の高いスコープ」のため、Googleの審査を受けるまでは「このアプリは確認されていません」という警告が出ます（「詳細」→「〜に移動」で進めます。未審査のままだと上限100人）。
-> - 会社と全スタッフが同じ **Google Workspace** のアカウントなら「内部」にすれば、審査も警告も不要です。
+> **個人のGmailアカウントでの連携について**
+> - Googleの審査を受けていない間は、連携時に「このアプリは確認されていません」と表示されます。「詳細」→「（アプリ名）に移動」で進めてください。
+> - 審査なしで連携できるのは延べ100アカウントまでです（超える場合はGoogleの審査を申請）。
+> - 会社と全スタッフが同じ **Google Workspace** のアカウントなら、同意画面を「内部」にすれば審査も警告も不要です。
 
-### 3. このサーバー
+### 3. Square
 
-```bash
-npm install          # 型チェック用の開発ツールのみ
-cp .env.example .env # 値を記入
-npm start
-```
+1. [Square Developer Dashboard](https://developer.squareup.com/apps) でアプリを作成し、本番の**アクセストークン**を Railway の Variables に設定
+2. （任意・推奨）Webhooks → サブスクリプションを追加
+   - URL: セットアップ状況の「Webhookの通知先URL」をコピーして貼り付け
+   - イベント: `labor.scheduled_shift.published`, `labor.scheduled_shift.updated`, `labor.scheduled_shift.deleted`
+   - 作成後に表示される **Signature key** を Railway の `SQUARE_WEBHOOK_SIGNATURE_KEY` に設定
 
-ブラウザで `BASE_URL` を開き、ユーザー名 `admin` / `ADMIN_PASSWORD` でログインします。
+### 4. 管理画面での設定
 
 1. 「会社アカウントと連携する」→ 店舗カレンダーを持っている会社のGoogleアカウントでログイン
 2. 「店舗ごとの書き込み先カレンダー」で、各店舗のカレンダーを選ぶ
@@ -78,6 +98,14 @@ npm start
 
 以降は Webhook と定期同期（既定15分ごと）で自動反映されます。
 
+### パソコンで動かす場合（開発・お試し用）
+
+```bash
+npm install          # 型チェック用の開発ツールのみ
+cp .env.example .env # 値を記入
+npm start            # または: docker build -t shift-cal . && docker run -p 3000:3000 --env-file .env -v shift-data:/data shift-cal
+```
+
 ## 連携はいつまで続くか
 
 一度連携すれば、更新作業なしで使い続けられます。次の場合だけ「再連携が必要」と管理画面に表示されるので、連携リンクを再発行してください。
@@ -86,11 +114,11 @@ npm start
 - Google Cloud の同意画面が「テスト」状態のまま（7日で切れます → 「本番環境」に公開してください）
 - 6か月以上まったく同期が行われなかった
 
-## 設定（.env）
+## 設定（環境変数）
 
 | 変数 | 説明 | 既定値 |
 | --- | --- | --- |
-| `BASE_URL` | 外部から見たURL（リダイレクトURI・Webhook署名に使用） | `http://localhost:3000` |
+| `BASE_URL` | 外部から見たURL（リダイレクトURI・Webhook署名に使用） | 自動判定（Railway / Render / Fly.io） |
 | `ADMIN_PASSWORD` | 管理画面のパスワード（未設定だと管理画面は開けません） | — |
 | `SQUARE_ACCESS_TOKEN` | Squareのアクセストークン | — |
 | `SQUARE_ENVIRONMENT` | `production` / `sandbox` | `sandbox` |
@@ -104,6 +132,8 @@ npm start
 | `EVENT_TITLE_TEMPLATE` | 予定タイトル（`{name}`=氏名, `{location}`=店舗名, `{job}`=職種） | `【出勤】{name}` |
 
 cron等で1回だけ同期したい場合は `npm run sync` を使えます。
+
+データベースの保存先（`DATABASE_PATH`）も自動で決まります（Railway の Volume → `/data/app.db`）。
 
 ## 開発
 

@@ -4,6 +4,7 @@ import type { App } from "./app.ts";
 import { COMPANY, staffKey } from "./db.ts";
 import { hasScopes } from "./google.ts";
 import { teamMemberName, verifySquareSignature } from "./square.ts";
+import type { SetupCheck } from "./setup.ts";
 import { formatSummary } from "./sync.ts";
 import { renderDashboard, renderLinkIssued, renderStaffPage } from "./views.ts";
 
@@ -13,6 +14,7 @@ export type HttpSettings = {
   webhookUrl: string;
   webhookSignatureKey: string;
   defaultStoreCalendarId: string;
+  setupChecks?: () => SetupCheck[];
 };
 
 const SHIFT_EVENT_TYPES = new Set([
@@ -82,6 +84,7 @@ export function createHandler(app: App, s: HttpSettings) {
             webhookUrl: s.webhookUrl,
             webhookEnabled: Boolean(s.webhookSignatureKey),
             defaultStoreCalendarId: s.defaultStoreCalendarId,
+            setup: s.setupChecks?.() ?? [],
           });
           return send(res, 200, html, "text/html");
         }
