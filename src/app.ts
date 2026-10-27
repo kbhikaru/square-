@@ -25,7 +25,7 @@ export function createApp() {
     settings: {
       daysAhead: config.sync.daysAhead,
       defaultTimezone: config.sync.defaultTimezone,
-      titlePrefix: config.sync.titlePrefix,
+      titleTemplate: config.sync.titleTemplate,
       locationIds: config.square.locationIds,
       defaultStoreCalendarId: config.google.defaultStoreCalendarId,
     },

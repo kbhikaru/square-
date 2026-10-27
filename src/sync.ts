@@ -6,7 +6,8 @@ import { teamMemberName, type ScheduledShift, type ScheduledShiftDetails, type S
 export type SyncSettings = {
   daysAhead: number;
   defaultTimezone: string;
-  titlePrefix: string;
+  /** 予定タイトルのひな形。{name}=氏名, {location}=店舗名, {job}=職種 */
+  titleTemplate: string;
   locationIds: string[];
   /** 店舗ごとの設定が無い場合に使う、会社アカウント内のカレンダー */
   defaultStoreCalendarId: string;
@@ -48,7 +49,7 @@ type EventContext = {
   member: TeamMember | undefined;
   locationName: string | undefined;
   jobTitle: string | undefined;
-  settings: Pick<SyncSettings, "defaultTimezone" | "titlePrefix">;
+  settings: Pick<SyncSettings, "defaultTimezone" | "titleTemplate">;
 };
 
 function baseEvent(c: EventContext, target: EventTarget, summary: string): CalendarEvent {
@@ -76,20 +77,31 @@ function baseEvent(c: EventContext, target: EventTarget, summary: string): Calen
   };
 }
 
-/** スタッフ本人のカレンダー用：タイトルは「店舗 / 職種」 */
+/** 予定タイトル（既定は「【出勤】氏名」）。本人用・店舗用で共通 */
+export function eventTitle(c: EventContext): string {
+  const values: Record<string, string> = {
+    name: teamMemberName(c.member) || "スタッフ",
+    location: c.locationName ?? "",
+    job: c.jobTitle ?? "",
+  };
+  const title = c.settings.titleTemplate
+    .replace(/\{(name|location|job)\}/g, (_, k: string) => values[k])
+    .replace(/[\s/／・]+$/, "")
+    .trim();
+  return title || values.name;
+}
+
+/** スタッフ本人のカレンダー用 */
 export function buildStaffEvent(c: EventContext): CalendarEvent {
-  const title = [c.locationName, c.jobTitle].filter(Boolean).join(" / ") || "勤務";
-  return baseEvent(c, "staff", `${c.settings.titlePrefix}${title}`);
+  return baseEvent(c, "staff", eventTitle(c));
 }
 
 /**
- * 店舗カレンダー用：誰のシフトか分かるようにタイトルはスタッフ名。
+ * 店舗カレンダー用。
  * inviteEmail があれば（本人がGoogle未連携の場合）招待も送る
  */
 export function buildStoreEvent(c: EventContext & { inviteEmail: string | null }): CalendarEvent {
-  const name = teamMemberName(c.member) || "スタッフ";
-  const title = c.jobTitle ? `${name}（${c.jobTitle}）` : name;
-  const ev = baseEvent(c, "store", `${c.settings.titlePrefix}${title}`);
+  const ev = baseEvent(c, "store", eventTitle(c));
   return {
     ...ev,
     attendees: c.inviteEmail ? [{ email: c.inviteEmail, ...(teamMemberName(c.member) ? { displayName: teamMemberName(c.member) } : {}) }] : [],

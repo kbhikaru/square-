@@ -45,7 +45,8 @@ export const config = {
     daysAhead: int("SYNC_DAYS_AHEAD", 30),
     intervalMinutes: int("SYNC_INTERVAL_MINUTES", 15),
     defaultTimezone: str("DEFAULT_TIMEZONE", "Asia/Tokyo"),
-    titlePrefix: str("EVENT_TITLE_PREFIX", "【シフト】"),
+    // 予定タイトル。{name}=氏名, {location}=店舗名, {job}=職種
+    titleTemplate: str("EVENT_TITLE_TEMPLATE", "【出勤】{name}"),
   },
 };
 

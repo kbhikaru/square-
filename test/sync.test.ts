@@ -8,7 +8,7 @@ import { SyncService, buildStaffEvent, buildStoreEvent, eventIdForShift } from "
 const settings = {
   daysAhead: 30,
   defaultTimezone: "Asia/Tokyo",
-  titlePrefix: "【シフト】",
+  titleTemplate: "【出勤】{name}",
   locationIds: [],
   defaultStoreCalendarId: "default-store@group.calendar.google.com",
 };
@@ -97,7 +97,7 @@ test("予定IDはGoogleで使える文字だけで、店舗用と本人用で別
   assert.equal(a, eventIdForShift("SHIFT_abc-123", "store"));
 });
 
-test("本人用はタイトルが店舗名、店舗用はタイトルがスタッフ名", () => {
+test("タイトルは本人用・店舗用とも「【出勤】氏名」", () => {
   const ctx = {
     shift: shift("s1"),
     member: { id: "tm1", given_name: "花子", family_name: "山田" },
@@ -106,15 +106,22 @@ test("本人用はタイトルが店舗名、店舗用はタイトルがスタ�
     settings,
   };
   const staff = buildStaffEvent(ctx);
-  assert.equal(staff.summary, "【シフト】渋谷店 / ホール");
+  assert.equal(staff.summary, "【出勤】山田 花子");
+  assert.equal(staff.location, "渋谷店");
   assert.equal(staff.attendees, undefined);
   assert.deepEqual(staff.start, { dateTime: "2026-11-01T09:00:00+09:00", timeZone: "Asia/Tokyo" });
   assert.match(staff.description!, /メモ: レジ担当/);
 
   const store = buildStoreEvent({ ...ctx, inviteEmail: null });
-  assert.equal(store.summary, "【シフト】山田 花子（ホール）");
+  assert.equal(store.summary, "【出勤】山田 花子");
   assert.deepEqual(store.attendees, []);
   assert.deepEqual(buildStoreEvent({ ...ctx, inviteEmail: "x@example.com" }).attendees, [{ email: "x@example.com", displayName: "山田 花子" }]);
+});
+
+test("タイトルのひな形で店舗名・職種も入れられる（空の項目は詰める）", () => {
+  const ctx = { shift: shift("s1"), member: { id: "tm1", given_name: "花子", family_name: "山田" }, locationName: "渋谷店", jobTitle: undefined };
+  assert.equal(buildStaffEvent({ ...ctx, settings: { ...settings, titleTemplate: "【出勤】{name} {location}" } }).summary, "【出勤】山田 花子 渋谷店");
+  assert.equal(buildStaffEvent({ ...ctx, settings: { ...settings, titleTemplate: "【出勤】{name} / {job}" } }).summary, "【出勤】山田 花子");
 });
 
 // ---------------- 書き込み先 ----------------
@@ -127,7 +134,7 @@ test("連携済みスタッフ: 本人のカレンダーと店舗カレンダー
 
   const mine = cal.in(staffKey("tm1"), "primary");
   assert.equal(mine.length, 1);
-  assert.equal(mine[0].summary, "【シフト】渋谷店 / ホール");
+  assert.equal(mine[0].summary, "【出勤】山田 花子");
 
   const shop = cal.in(COMPANY, STORE_CAL);
   assert.equal(shop.length, 1);
