@@ -1,5 +1,9 @@
 # Squareシフト → Googleカレンダー連携
 
+> ## 🆓 まずは無料版がおすすめ
+> **[gas/README.md](gas/README.md)** — Googleスプレッドシート＋Apps Script だけで動きます（費用0円・サーバー不要・Google Cloud設定不要）。
+> 以下は、即時反映（Webhook）が必要な場合のサーバー版（月5ドル程度）の説明です。
+
 Squareで**公開したシフト**を、次の2か所のGoogleカレンダーへ自動で書き込むサーバーです。
 
 1. **スタッフ本人のGoogleカレンダー**（スタッフ各自がGoogleアカウントを連携）
