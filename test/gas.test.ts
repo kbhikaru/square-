@@ -353,24 +353,54 @@ test("作成した予定から Google Meet を外す（本人・店舗とも）"
   assert.ok(all.every((e) => e.meet === false));
 });
 
-test("以前に作った予定の Meet も、次の同期で一度だけ外す", () => {
-  const { gas, calendar, sync, square, props, meetPatches } = ready();
+test("以前に作った予定の Meet も外し、外し終わったら確認をやめる", () => {
+  const { calendar, sync, square, calendarApi, meetCalls } = ready();
   const hanako = calendar.share("hanako@gmail.com");
   square.shifts = [shift("s1")];
-  // Meet を外す機能が無かった頃に作られた状態を再現
-  const original = gas.removeMeet_;
-  gas.removeMeet_ = () => true;
-  props.set("MEET_REMOVED_V1", "x");
-  sync();
-  gas.removeMeet_ = original;
-  assert.equal(hanako.list()[0].meet, true);
 
-  props.delete("MEET_REMOVED_V1");
-  sync();
+  // Calendar API が無効な状態で作られた（Meet が残った）
+  calendarApi.disabled = true;
+  const first = sync();
+  assert.equal(hanako.list()[0].meet, true);
+  assert.match(first, /Meetの削除に失敗: Google Calendar API が無効です/);
+  assert.match(first, /「サービス」の＋から「Google Calendar API」を追加/);
+
+  // 有効になった次の同期でまとめて外れる
+  calendarApi.disabled = false;
+  const second = sync();
   assert.equal(hanako.list()[0].meet, false);
   assert.equal(calendar.main.list()[0].meet, false);
+  assert.match(second, /Meet削除2/);
+  assert.match(second, /エラー0/);
 
-  const before = meetPatches.length;
-  sync(); // 2回目以降は何もしない
-  assert.equal(meetPatches.length, before);
+  // 全部外し終わったら、以降は既存の予定を確認しない
+  const before = meetCalls.length;
+  sync();
+  assert.equal(meetCalls.length, before);
+});
+
+test("Meet が付いていない予定は上書きしない", () => {
+  const { calendar, sync, square, meetCalls } = ready();
+  calendar.share("hanako@gmail.com");
+  square.shifts = [shift("s1")];
+  sync();
+  const puts = meetCalls.filter((c) => c.startsWith("PUT")).length;
+  assert.equal(puts, 2); // 新規作成の2件だけ
+  meetCalls.length = 0;
+  square.shifts = [shift("s1", { notes: "変更" })];
+  sync();
+  assert.equal(meetCalls.filter((c) => c.startsWith("PUT")).length, 0);
+});
+
+test("動作確認用の checkMeetRemoval が結果をログに出す", () => {
+  const { gas, calendar, sync, square, calendarApi, logs } = ready();
+  calendar.share("hanako@gmail.com");
+  square.shifts = [shift("s1")];
+  calendarApi.disabled = true;
+  sync();
+  gas.checkMeetRemoval();
+  assert.match(logs.at(-1)!, /error[\s\S]*Google Calendar API が無効です/);
+  calendarApi.disabled = false;
+  gas.checkMeetRemoval();
+  assert.match(logs.at(-1)!, /→ removed/);
 });
