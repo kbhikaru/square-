@@ -147,6 +147,8 @@ function runSync_(ss, trigger, now) {
       summary: summary,
     };
 
+    removeMeetFromExisting_(ctx.records);
+
     var shifts = api.searchPublishedShifts(from, to);
     var seen = {};
     shifts.forEach(function (s) {
@@ -282,7 +284,42 @@ function createEvent_(cal, want, shiftId) {
   }
   var ev = cal.createEvent(c.title, new Date(c.start), new Date(c.end), opts);
   ev.setTag('squareShiftId', shiftId);
+  removeMeet_(cal.getId(), ev.getId());
   return ev;
+}
+
+/**
+ * Google Meet を外す。Workspace の「予定に Meet を自動で追加」設定で、
+ * スクリプトが作った予定にも Meet が付いてしまうため。
+ */
+function removeMeet_(calId, eventId) {
+  var id = String(eventId).replace(/@google\.com$/, '');
+  try {
+    var res = UrlFetchApp.fetch(
+      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(calId) +
+        '/events/' + encodeURIComponent(id) + '?conferenceDataVersion=1&sendUpdates=none',
+      {
+        method: 'patch',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+        payload: JSON.stringify({ conferenceData: null }),
+        muteHttpExceptions: true,
+      });
+    return res.getResponseCode() < 300;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 以前に作った予定から、一度だけ Meet を外す */
+function removeMeetFromExisting_(records) {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('MEET_REMOVED_V1')) return;
+  Object.keys(records).forEach(function (k) {
+    var r = records[k];
+    if (r.eventId && r.calId && r.status === 'synced') removeMeet_(r.calId, r.eventId);
+  });
+  props.setProperty('MEET_REMOVED_V1', String(Date.now()));
 }
 
 function updateEvent_(ev, want) {
