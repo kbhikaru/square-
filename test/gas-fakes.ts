@@ -350,7 +350,9 @@ export function loadGas() {
   const props = new Map<string, string>();
   const cache = new Map<string, string>();
   const triggers: { handler: string; kind: string }[] = [];
-  const meetPatches: string[] = [];
+  const meetCalls: string[] = [];
+  const calendarApi = { disabled: false };
+  const logs: string[] = [];
 
   const builder = (kind: string) => {
     const b: any = {
@@ -382,16 +384,31 @@ export function loadGas() {
     CalendarApp: calendar,
     UrlFetchApp: {
       fetch: (url: string, opts: any) => {
-        // Google Calendar API（Meet を外す PATCH）
-        const m = url.match(/^https:\/\/www\.googleapis\.com\/calendar\/v3\/calendars\/([^/]+)\/events\/([^?]+)\?(.*)$/);
+        // Google Calendar API（Meet を外すための GET / PUT）
+        const m = url.match(/^https:\/\/www\.googleapis\.com\/calendar\/v3\/calendars\/([^/]+)\/events\/([^?]+)(?:\?(.*))?$/);
         if (m) {
-          const ok = opts.headers?.Authorization === "Bearer fake-oauth-token" && opts.method === "patch" &&
-            /conferenceDataVersion=1/.test(m[3]) && JSON.parse(opts.payload).conferenceData === null;
+          const reply = (code: number, body: unknown) => ({ getResponseCode: () => code, getContentText: () => JSON.stringify(body) });
+          meetCalls.push(`${opts.method.toUpperCase()} ${decodeURIComponent(m[1])}/${decodeURIComponent(m[2])}`);
+          if (calendarApi.disabled) {
+            return reply(403, { error: { code: 403, message: "Google Calendar API has not been used in project 123 before or it is disabled.", status: "PERMISSION_DENIED", details: [{ reason: "SERVICE_DISABLED" }] } });
+          }
+          if (opts.headers?.Authorization !== "Bearer fake-oauth-token") return reply(401, {});
           const cal = calendar.calendars.get(decodeURIComponent(m[1]));
           const ev = cal?.getEventById(`${decodeURIComponent(m[2])}@google.com`);
-          if (ok && ev) ev.meet = false;
-          meetPatches.push(`${decodeURIComponent(m[1])}/${decodeURIComponent(m[2])}`);
-          return { getResponseCode: () => (ok && ev ? 200 : 404), getContentText: () => "{}" };
+          if (!ev) return reply(404, { error: { code: 404 } });
+          if (opts.method === "get") {
+            return reply(200, {
+              id: decodeURIComponent(m[2]),
+              summary: ev.title,
+              ...(ev.meet ? { hangoutLink: "https://meet.google.com/abc-defg-hij", conferenceData: { conferenceId: "abc-defg-hij" } } : {}),
+            });
+          }
+          if (opts.method === "put") {
+            const body = JSON.parse(opts.payload);
+            if (/conferenceDataVersion=1/.test(m[3] ?? "") && !body.conferenceData) ev.meet = false;
+            return reply(200, body);
+          }
+          return reply(405, {});
         }
         return square.fetch(url, opts);
       },
@@ -400,6 +417,7 @@ export function loadGas() {
       getScriptProperties: () => ({
         getProperty: (k: string) => props.get(k) ?? null,
         setProperty: (k: string, v: string) => props.set(k, v),
+        deleteProperty: (k: string) => props.delete(k),
       }),
     },
     CacheService: {
@@ -408,6 +426,7 @@ export function loadGas() {
         put: (k: string, v: string) => cache.set(k, v),
       }),
     },
+    Logger: { log: (m: string) => logs.push(m) },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     ScriptApp: {
       getOAuthToken: () => "fake-oauth-token",
@@ -440,5 +459,5 @@ export function loadGas() {
   vm.runInContext(readFileSync(new URL("../gas/Code.gs", import.meta.url), "utf8"), context, { filename: "Code.gs" });
   const gas = context as any;
 
-  return { gas, ss, calendar, square, props, cache, triggers, meetPatches };
+  return { gas, ss, calendar, square, props, cache, triggers, meetCalls, calendarApi, logs };
 }

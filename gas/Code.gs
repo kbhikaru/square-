@@ -124,7 +124,7 @@ function runSync_(ss, trigger, now) {
   }
   var cfg = readConfig_(ss);
   var api = squareApi_(token, cfg.env);
-  var summary = { shifts: 0, created: 0, updated: 0, unchanged: 0, deleted: 0, noDest: 0, error: 0, errors: [] };
+  var summary = { shifts: 0, created: 0, updated: 0, unchanged: 0, deleted: 0, noDest: 0, meetRemoved: 0, error: 0, errors: [] };
 
   try {
     var from = new Date(now.getTime() - 24 * 3600 * 1000);
@@ -147,7 +147,8 @@ function runSync_(ss, trigger, now) {
       summary: summary,
     };
 
-    removeMeetFromExisting_(ctx.records);
+    meetErrors_ = [];
+    removeMeetFromExisting_(ctx.records, summary);
 
     var shifts = api.searchPublishedShifts(from, to);
     var seen = {};
@@ -168,6 +169,14 @@ function runSync_(ss, trigger, now) {
     summary.error++;
     summary.errors.unshift(errorText_(err));
   }
+  if (meetErrors_.length) {
+    // 外せなかった予定があるので、次の同期で全件を確認し直す
+    PropertiesService.getScriptProperties().deleteProperty('MEET_REMOVED_V2');
+  }
+  meetErrors_.forEach(function (m) {
+    summary.error++;
+    summary.errors.push('Meetの削除に失敗: ' + m);
+  });
 
   var text = formatSummary_(summary);
   writeLog_(ss, trigger, text);
@@ -291,35 +300,88 @@ function createEvent_(cal, want, shiftId) {
 /**
  * Google Meet を外す。Workspace の「予定に Meet を自動で追加」設定で、
  * スクリプトが作った予定にも Meet が付いてしまうため。
+ * 戻り値: removed（外した）/ none（もともと無い）/ notfound / error
  */
+var meetErrors_ = [];
 function removeMeet_(calId, eventId) {
   var id = String(eventId).replace(/@google\.com$/, '');
   try {
-    var res = UrlFetchApp.fetch(
-      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(calId) +
-        '/events/' + encodeURIComponent(id) + '?conferenceDataVersion=1&sendUpdates=none',
-      {
-        method: 'patch',
-        contentType: 'application/json',
-        headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-        payload: JSON.stringify({ conferenceData: null }),
-        muteHttpExceptions: true,
-      });
-    return res.getResponseCode() < 300;
+    var ev = calendarApi_('get', calId, id);
+    if (!ev) return 'notfound';
+    if (!ev.conferenceData && !ev.hangoutLink) return 'none';
+    // conferenceData を含めずに上書きすると、Meet が外れる（参加者への通知は送らない）
+    delete ev.conferenceData;
+    delete ev.hangoutLink;
+    calendarApi_('put', calId, id, ev);
+    return 'removed';
   } catch (e) {
-    return false;
+    var msg = errorText_(e);
+    if (/accessNotConfigured|has not been used|is disabled|SERVICE_DISABLED/i.test(msg)) {
+      msg = 'Google Calendar API が無効です。Apps Script の左の「サービス」の＋から「Google Calendar API」を追加してください';
+    }
+    if (meetErrors_.indexOf(msg) < 0) meetErrors_.push(msg);
+    return 'error';
   }
 }
 
-/** 以前に作った予定から、一度だけ Meet を外す */
-function removeMeetFromExisting_(records) {
+/** Google Calendar API（詳細サービスが追加されていればそれを、無ければ直接呼ぶ） */
+function calendarApi_(method, calId, id, body) {
+  if (typeof Calendar !== 'undefined' && Calendar.Events) {
+    if (method === 'get') {
+      try {
+        return Calendar.Events.get(calId, id);
+      } catch (e) {
+        if (/not found|404|deleted|410/i.test(String(e))) return null;
+        throw e;
+      }
+    }
+    return Calendar.Events.update(body, calId, id, { conferenceDataVersion: 1, sendUpdates: 'none' });
+  }
+  var url = 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(calId) + '/events/' + encodeURIComponent(id) +
+    (method === 'put' ? '?conferenceDataVersion=1&sendUpdates=none' : '');
+  var res = UrlFetchApp.fetch(url, {
+    method: method,
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    payload: body ? JSON.stringify(body) : undefined,
+    muteHttpExceptions: true,
+  });
+  var code = res.getResponseCode();
+  if (method === 'get' && (code === 404 || code === 410)) return null;
+  if (code >= 300) throw new Error('Calendar API ' + code + ': ' + res.getContentText().slice(0, 300));
+  return JSON.parse(res.getContentText() || '{}');
+}
+
+/** 以前に作った予定から Meet を外す。すべて成功するまで同期のたびに再試行する */
+function removeMeetFromExisting_(records, summary) {
   var props = PropertiesService.getScriptProperties();
-  if (props.getProperty('MEET_REMOVED_V1')) return;
+  if (props.getProperty('MEET_REMOVED_V2')) return;
+  var failed = false;
   Object.keys(records).forEach(function (k) {
     var r = records[k];
-    if (r.eventId && r.calId && r.status === 'synced') removeMeet_(r.calId, r.eventId);
+    if (!r.eventId || !r.calId || r.status !== 'synced') return;
+    var result = removeMeet_(r.calId, r.eventId);
+    if (result === 'removed') summary.meetRemoved++;
+    if (result === 'error') failed = true;
   });
-  props.setProperty('MEET_REMOVED_V1', String(Date.now()));
+  if (!failed) props.setProperty('MEET_REMOVED_V2', String(Date.now()));
+}
+
+/**
+ * 動作確認用：Apps Script で選んで実行すると、Meet を外せるか試して結果を表示します
+ * （「実行ログ」に結果が出ます）
+ */
+function checkMeetRemoval() {
+  var records = loadRecords_(SpreadsheetApp.getActive());
+  var keys = Object.keys(records).filter(function (k) { return records[k].status === 'synced' && records[k].eventId; });
+  if (!keys.length) {
+    Logger.log('同期済みの予定がまだありません');
+    return;
+  }
+  meetErrors_ = [];
+  var r = records[keys[0]];
+  var result = removeMeet_(r.calId, r.eventId);
+  Logger.log('対象: ' + r.calId + ' / ' + r.eventId + ' → ' + result + (meetErrors_.length ? '\n' + meetErrors_.join('\n') : ''));
 }
 
 function updateEvent_(ev, want) {
@@ -403,7 +465,7 @@ function liveShiftIdsBetween_(records, from, to) {
 
 function formatSummary_(s) {
   var t = 'シフト' + s.shifts + '件 / 新規' + s.created + ' / 更新' + s.updated + ' / 変更なし' + s.unchanged +
-    ' / 削除' + s.deleted + ' / 送信先なし' + s.noDest + ' / エラー' + s.error;
+    ' / 削除' + s.deleted + ' / 送信先なし' + s.noDest + (s.meetRemoved ? ' / Meet削除' + s.meetRemoved : '') + ' / エラー' + s.error;
   return s.errors.length ? t + '\n' + s.errors.slice(0, 5).join('\n') : t;
 }
 
