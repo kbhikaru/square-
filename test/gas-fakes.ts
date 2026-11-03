@@ -407,7 +407,14 @@ export function loadGas() {
       DigestAlgorithm: { SHA_256: "sha256" },
       Charset: { UTF_8: "utf8" },
       computeDigest: (_alg: string, text: string) => [...createHash("sha256").update(text).digest()].map((b) => (b > 127 ? b - 256 : b)),
-      formatDate: (d: Date) => d.toISOString(),
+      formatDate: (d: Date, tz: string, pattern: string) => {
+        const parts = Object.fromEntries(
+          new Intl.DateTimeFormat("en-US", { timeZone: tz, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+            .formatToParts(d)
+            .map((p) => [p.type, p.value]),
+        );
+        return pattern === "M/d HH:mm" ? `${parts.month}/${parts.day} ${parts.hour}:${parts.minute}` : d.toISOString();
+      },
     },
   };
   vm.createContext(context);

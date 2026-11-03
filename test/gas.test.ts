@@ -264,3 +264,78 @@ test("共有が解除されたスタッフ: 本人側は消せないが、店舗
   assert.match(msg, /エラー0/);
   assert.deepEqual(shibuya.list()[0].guests, ["hanako@gmail.com"]);
 });
+
+// ---------------- ダッシュボード ----------------
+
+test("ダッシュボード: 集計・シフト一覧・スタッフ状態を返す", () => {
+  const { gas, calendar, sync, setStoreCalendar, square } = ready();
+  setStoreCalendar("loc1", "渋谷店シフト");
+  calendar.share("hanako@gmail.com");
+  const base = Date.now();
+  const at = (h: number) => new Date(base + h * 3600_000).toISOString();
+  square.shifts = [
+    shift("s1", { start_at: at(24), end_at: at(32) }),
+    shift("s2", { team_member_id: "tm2", start_at: at(48), end_at: at(53) }),
+  ];
+  sync(new Date());
+  const d = JSON.parse(JSON.stringify(gas.dashboardData()));
+
+  assert.equal(d.settings.tokenSet, true);
+  assert.equal(d.settings.autoSync, true);
+  assert.equal(d.settings.title, "【出勤】{name}");
+  assert.ok(d.calendarOptions.includes("渋谷店シフト"));
+  assert.ok(d.calendarOptions.includes("（書き込まない）"));
+  assert.equal(d.stores.length, 2);
+
+  assert.equal(d.shifts.length, 2);
+  const [a, b] = d.shifts;
+  assert.equal(a.name, "山田 花子");
+  assert.equal(a.location, "渋谷店");
+  assert.equal(a.end, at(32));
+  assert.equal(a.staff.status, "synced");
+  assert.equal(b.store.guests, "taro@gmail.com");
+
+  assert.equal(d.stats.upcoming, 2);
+  assert.equal(d.stats.staffTotal, 3);
+  assert.equal(d.stats.staffDirect, 1);
+  assert.equal(d.stats.staffInvite, 1);
+  assert.equal(d.stats.staffNone, 1);
+  assert.equal(d.stats.storesUnset, 1);
+  assert.equal(d.logs.length, 1);
+});
+
+test("ダッシュボード: 設定・店舗・スタッフの保存", () => {
+  const { gas, ss, props, square } = ready();
+  square.token = "NEW-TOKEN";
+  gas.dashboardSaveSettings({ token: "NEW-TOKEN", env: "サンドボックス", days: "45", title: "【出勤】{name} {location}", defaultCal: "渋谷店シフト" });
+  assert.equal(props.get("SQUARE_ACCESS_TOKEN"), "NEW-TOKEN");
+  assert.equal(ss.setting("Square環境"), "サンドボックス");
+  assert.equal(ss.setting("同期する日数"), 45);
+  assert.equal(ss.setting("予定タイトル"), "【出勤】{name} {location}");
+  assert.equal(ss.setting("既定の店舗カレンダー"), "渋谷店シフト");
+
+  // トークン空欄なら変更しない
+  gas.dashboardSaveSettings({ token: "", days: 30 });
+  assert.equal(props.get("SQUARE_ACCESS_TOKEN"), "NEW-TOKEN");
+  assert.throws(() => gas.dashboardSaveSettings({ days: 0 }), /1〜180/);
+  assert.throws(() => gas.dashboardSaveSettings({ title: " " }), /タイトル/);
+
+  const d1 = gas.dashboardSaveStore("loc2", "新宿店シフト");
+  assert.equal(d1.stores.find((x: any) => x.id === "loc2").calendar, "新宿店シフト");
+
+  const d2 = gas.dashboardSaveStaff("tm3", "jiro@gmail.com");
+  assert.equal(d2.staff.find((x: any) => x.id === "tm3").calendar, "jiro@gmail.com");
+  assert.throws(() => gas.dashboardSaveStaff("tm3", "not-an-email"), /形式/);
+  assert.throws(() => gas.dashboardSaveStaff("nobody", "a@b.co"), /見つかりません/);
+});
+
+test("ダッシュボード: 今すぐ同期で結果と最新データを返す", () => {
+  const { gas, calendar, square } = ready();
+  const hanako = calendar.share("hanako@gmail.com");
+  square.shifts = [shift("s1", { start_at: new Date(Date.now() + 86400000).toISOString(), end_at: new Date(Date.now() + 90000000).toISOString() })];
+  gas.ownedCalendarsCache_ = null;
+  const res = gas.dashboardSync();
+  assert.match(res.message, /新規2/);
+  assert.equal(res.data.shifts.length, 1);
+  assert.equal(hanako.list().length, 1);
+});
