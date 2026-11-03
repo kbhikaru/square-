@@ -339,3 +339,38 @@ test("ダッシュボード: 今すぐ同期で結果と最新データを返す
   assert.equal(res.data.shifts.length, 1);
   assert.equal(hanako.list().length, 1);
 });
+
+// ---------------- Google Meet ----------------
+
+test("作成した予定から Google Meet を外す（本人・店舗とも）", () => {
+  const { calendar, sync, setStoreCalendar, shibuya, square } = ready();
+  setStoreCalendar("loc1", "渋谷店シフト");
+  const hanako = calendar.share("hanako@gmail.com");
+  square.shifts = [shift("s1"), shift("s2", { team_member_id: "tm2" })];
+  sync();
+  const all = [...hanako.list(), ...shibuya.list()];
+  assert.equal(all.length, 3);
+  assert.ok(all.every((e) => e.meet === false));
+});
+
+test("以前に作った予定の Meet も、次の同期で一度だけ外す", () => {
+  const { gas, calendar, sync, square, props, meetPatches } = ready();
+  const hanako = calendar.share("hanako@gmail.com");
+  square.shifts = [shift("s1")];
+  // Meet を外す機能が無かった頃に作られた状態を再現
+  const original = gas.removeMeet_;
+  gas.removeMeet_ = () => true;
+  props.set("MEET_REMOVED_V1", "x");
+  sync();
+  gas.removeMeet_ = original;
+  assert.equal(hanako.list()[0].meet, true);
+
+  props.delete("MEET_REMOVED_V1");
+  sync();
+  assert.equal(hanako.list()[0].meet, false);
+  assert.equal(calendar.main.list()[0].meet, false);
+
+  const before = meetPatches.length;
+  sync(); // 2回目以降は何もしない
+  assert.equal(meetPatches.length, before);
+});

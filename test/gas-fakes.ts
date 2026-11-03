@@ -188,6 +188,8 @@ export class FakeEvent {
   guests: string[] = [];
   tags: Record<string, string> = {};
   invitesSent = false;
+  /** Google Meet が付いているか（Workspaceの自動追加設定を再現） */
+  meet = true;
   readonly calendar: FakeCalendar;
   constructor(cal: FakeCalendar, title: string, start: Date, end: Date) {
     this.calendar = cal;
@@ -348,6 +350,7 @@ export function loadGas() {
   const props = new Map<string, string>();
   const cache = new Map<string, string>();
   const triggers: { handler: string; kind: string }[] = [];
+  const meetPatches: string[] = [];
 
   const builder = (kind: string) => {
     const b: any = {
@@ -377,7 +380,22 @@ export function loadGas() {
       getUi: () => ({ createMenu: () => ({ addItem() { return this; }, addSeparator() { return this; }, addToUi() {} }) }),
     },
     CalendarApp: calendar,
-    UrlFetchApp: { fetch: (url: string, opts: any) => square.fetch(url, opts) },
+    UrlFetchApp: {
+      fetch: (url: string, opts: any) => {
+        // Google Calendar API（Meet を外す PATCH）
+        const m = url.match(/^https:\/\/www\.googleapis\.com\/calendar\/v3\/calendars\/([^/]+)\/events\/([^?]+)\?(.*)$/);
+        if (m) {
+          const ok = opts.headers?.Authorization === "Bearer fake-oauth-token" && opts.method === "patch" &&
+            /conferenceDataVersion=1/.test(m[3]) && JSON.parse(opts.payload).conferenceData === null;
+          const cal = calendar.calendars.get(decodeURIComponent(m[1]));
+          const ev = cal?.getEventById(`${decodeURIComponent(m[2])}@google.com`);
+          if (ok && ev) ev.meet = false;
+          meetPatches.push(`${decodeURIComponent(m[1])}/${decodeURIComponent(m[2])}`);
+          return { getResponseCode: () => (ok && ev ? 200 : 404), getContentText: () => "{}" };
+        }
+        return square.fetch(url, opts);
+      },
+    },
     PropertiesService: {
       getScriptProperties: () => ({
         getProperty: (k: string) => props.get(k) ?? null,
@@ -392,6 +410,7 @@ export function loadGas() {
     },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     ScriptApp: {
+      getOAuthToken: () => "fake-oauth-token",
       getProjectTriggers: () => triggers.map((t) => ({ getHandlerFunction: () => t.handler })),
       deleteTrigger: (t: { getHandlerFunction: () => string }) => {
         const i = triggers.findIndex((x) => x.handler === t.getHandlerFunction());
@@ -421,5 +440,5 @@ export function loadGas() {
   vm.runInContext(readFileSync(new URL("../gas/Code.gs", import.meta.url), "utf8"), context, { filename: "Code.gs" });
   const gas = context as any;
 
-  return { gas, ss, calendar, square, props, cache, triggers };
+  return { gas, ss, calendar, square, props, cache, triggers, meetPatches };
 }
