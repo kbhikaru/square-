@@ -35,7 +35,7 @@ var SETTING_ROWS = [
   ['status', '最終同期', '', ''],
 ];
 
-var RECORD_HEADER = ['キー', 'シフトID', '対象', 'カレンダーID', '予定ID', 'ハッシュ', '状態', '開始', 'スタッフID', '招待先', 'メモ', '更新'];
+var RECORD_HEADER = ['キー', 'シフトID', '対象', 'カレンダーID', '予定ID', 'ハッシュ', '状態', '開始', 'スタッフID', '招待先', 'メモ', '更新', '店舗ID', '終了'];
 var TOKEN_SAVED = '設定済み（変更するときは新しいトークンを貼り付け）';
 
 // ===================== 最初に1回だけ実行 =====================
@@ -214,7 +214,9 @@ function reconcileTarget_(shiftId, target, want, d, removalReason, ctx) {
   var base = {
     key: key, shiftId: shiftId, target: target,
     start: d && d.start_at ? d.start_at : rec ? rec.start : '',
+    end: d && d.end_at ? d.end_at : rec ? rec.end : '',
     teamMemberId: d && d.team_member_id ? d.team_member_id : rec ? rec.teamMemberId : '',
+    locationId: d && d.location_id ? d.location_id : rec ? rec.locationId : '',
   };
 
   try {
@@ -368,6 +370,186 @@ function formatSummary_(s) {
   return s.errors.length ? t + '\n' + s.errors.slice(0, 5).join('\n') : t;
 }
 
+// ===================== ダッシュボード（Webアプリ） =====================
+// 「デプロイ」→「ウェブアプリ」で公開すると、Dashboard.html を管理画面として使えます。
+// 下の dashboard〜 関数は画面から呼ばれます（アクセスできるのは「自分のみ」にしてください）。
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Dashboard')
+    .setTitle('シフト連携ダッシュボード')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+}
+
+/** 画面に必要な情報をまとめて返す */
+function dashboardData() {
+  var ss = SpreadsheetApp.getActive();
+  ensureSheets_(ss);
+  var tz = ss.getSpreadsheetTimeZone();
+  var now = new Date();
+
+  var calendarOptions = ownedCalendars_().map(calendarLabel_);
+  calendarOptions.push(NONE_LABEL);
+
+  var stores = rowsOf_(ss.getSheetByName(SHEETS.stores), 3).map(function (r) {
+    return { id: String(r[0]), name: String(r[1] || r[0]), calendar: String(r[2] || '') };
+  });
+  var storeNames = {};
+  stores.forEach(function (st) { storeNames[st.id] = st.name; });
+
+  var staff = rowsOf_(ss.getSheetByName(SHEETS.staff), 5).map(function (r) {
+    var status = String(r[4] || '');
+    return {
+      id: String(r[0]), name: String(r[1] || r[0]), squareEmail: String(r[2] || ''), calendar: String(r[3] || ''),
+      status: status,
+      level: status.indexOf('✓') === 0 ? 'ok' : status.indexOf('✗') === 0 ? 'error' : status ? 'warn' : 'unknown',
+    };
+  });
+  var staffNames = {};
+  staff.forEach(function (m) { staffNames[m.id] = m.name; });
+
+  // 今後のシフト（同期記録から、シフトごとに 店舗 / 本人 をまとめる）
+  var records = loadRecords_(ss);
+  var byShift = {};
+  Object.keys(records).forEach(function (k) {
+    var r = records[k];
+    var start = new Date(r.start);
+    if (isNaN(start.getTime()) || start.getTime() < now.getTime() - 12 * 3600 * 1000) return;
+    var item = byShift[r.shiftId] || (byShift[r.shiftId] = {
+      id: r.shiftId, start: r.start, end: r.end || '', teamMemberId: r.teamMemberId,
+      name: staffNames[r.teamMemberId] || r.teamMemberId || '', location: storeNames[r.locationId] || '',
+    });
+    if (r.end) item.end = r.end;
+    if (r.locationId && storeNames[r.locationId]) item.location = storeNames[r.locationId];
+    item[r.target] = { status: r.status, note: r.note || '', guests: r.guests || '' };
+  });
+  var shifts = Object.keys(byShift).map(function (k) { return byShift[k]; })
+    .filter(function (x) { return !(isDeletedOnly_(x)); })
+    .sort(function (a, b) { return a.start < b.start ? -1 : a.start > b.start ? 1 : 0; })
+    .slice(0, 300);
+
+  var logSheet = ss.getSheetByName(SHEETS.log);
+  var logs = rowsOf_(logSheet, 3).slice(0, 30).map(function (r) {
+    return {
+      at: r[0] instanceof Date ? Utilities.formatDate(r[0], tz, 'M/d HH:mm') : String(r[0]),
+      trigger: String(r[1] || ''),
+      text: String(r[2] || ''),
+      error: /エラー[1-9]|エラー\d{2,}|正しくありません|未設定/.test(String(r[2] || '')),
+    };
+  });
+
+  var autoSync = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'syncShifts'; });
+  var cfgDefault = String(getSetting_(ss, 'defaultCal') || '');
+  var errors = shifts.filter(function (x) {
+    return (x.store && x.store.status === 'error') || (x.staff && x.staff.status === 'error');
+  }).length;
+
+  return {
+    timeZone: tz,
+    generatedAt: Utilities.formatDate(now, tz, 'M/d HH:mm'),
+    spreadsheetUrl: ss.getUrl ? ss.getUrl() : '',
+    settings: {
+      tokenSet: !!getToken_(),
+      env: String(getSetting_(ss, 'env') || '本番'),
+      days: Number(getSetting_(ss, 'days')) || 30,
+      title: String(getSetting_(ss, 'title') || '【出勤】{name}'),
+      defaultCal: cfgDefault,
+      lastSync: String(getSetting_(ss, 'status') || ''),
+      autoSync: autoSync,
+      everyMinutes: SYNC_EVERY_MINUTES,
+    },
+    calendarOptions: calendarOptions,
+    stores: stores,
+    staff: staff,
+    shifts: shifts,
+    logs: logs,
+    stats: {
+      upcoming: shifts.length,
+      staffTotal: staff.length,
+      staffDirect: staff.filter(function (m) { return m.level === 'ok'; }).length,
+      staffInvite: staff.filter(function (m) { return m.level === 'warn'; }).length,
+      staffNone: staff.filter(function (m) { return m.level === 'error'; }).length,
+      storesUnset: stores.filter(function (st) { return !st.calendar; }).length,
+      errors: errors,
+    },
+  };
+}
+
+function dashboardSync() {
+  var message = syncShifts('ダッシュボード');
+  return { message: message, data: dashboardData() };
+}
+
+function dashboardReload() {
+  var ss = SpreadsheetApp.getActive();
+  if (!getToken_()) throw new Error('先に「設定」でSquareのアクセストークンを登録してください');
+  loadMasters_(ss);
+  return dashboardData();
+}
+
+/** 設定の保存。token は入力された時だけ上書き */
+function dashboardSaveSettings(input) {
+  var ss = SpreadsheetApp.getActive();
+  ensureSheets_(ss);
+  input = input || {};
+  var token = String(input.token || '').trim();
+  if (token) {
+    PropertiesService.getScriptProperties().setProperty('SQUARE_ACCESS_TOKEN', token);
+    setSetting_(ss, 'token', TOKEN_SAVED);
+  }
+  if (input.env === '本番' || input.env === 'サンドボックス') setSetting_(ss, 'env', input.env);
+  if (input.days !== undefined) {
+    var days = Math.round(Number(input.days));
+    if (!(days >= 1 && days <= 180)) throw new Error('同期する日数は1〜180で入力してください');
+    setSetting_(ss, 'days', days);
+  }
+  if (input.title !== undefined) {
+    var title = String(input.title).trim();
+    if (!title) throw new Error('予定タイトルを入力してください');
+    setSetting_(ss, 'title', title);
+  }
+  if (input.defaultCal !== undefined) setSetting_(ss, 'defaultCal', String(input.defaultCal));
+  if (token) loadMasters_(ss);
+  return dashboardData();
+}
+
+function dashboardSaveStore(locationId, calendarLabel) {
+  var ss = SpreadsheetApp.getActive();
+  setCellById_(ss.getSheetByName(SHEETS.stores), locationId, 3, String(calendarLabel || ''));
+  return dashboardData();
+}
+
+function dashboardSaveStaff(teamMemberId, email) {
+  email = String(email || '').trim();
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('メールアドレスの形式が正しくありません: ' + email);
+  var ss = SpreadsheetApp.getActive();
+  setCellById_(ss.getSheetByName(SHEETS.staff), teamMemberId, 4, email);
+  return dashboardData();
+}
+
+function setCellById_(sh, id, col, value) {
+  var last = sh.getLastRow();
+  if (last >= 2) {
+    var ids = sh.getRange(2, 1, last - 1, 1).getValues();
+    for (var i = 0; i < ids.length; i++) {
+      if (String(ids[i][0]) === String(id)) {
+        sh.getRange(i + 2, col).setValue(value);
+        return;
+      }
+    }
+  }
+  throw new Error('見つかりません: ' + id);
+}
+
+function rowsOf_(sh, width) {
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues().filter(function (r) { return r[0] !== '' && r[0] !== null; });
+}
+
+function isDeletedOnly_(x) {
+  var targets = [x.store, x.staff].filter(function (t) { return t; });
+  return targets.length > 0 && targets.every(function (t) { return t.status === 'deleted'; });
+}
+
 // ===================== Square API =====================
 
 function squareApi_(token, env) {
@@ -464,6 +646,7 @@ function ensureSheets_(ss) {
   sheet_(ss, SHEETS.staff, ['チームメンバーID', '氏名', 'Squareのメール', '本人カレンダー（Gmail）', '状態']);
   sheet_(ss, SHEETS.log, ['日時', '種類', '結果']);
   var rec = sheet_(ss, SHEETS.records, RECORD_HEADER);
+  rec.getRange(1, 1, 1, RECORD_HEADER.length).setValues([RECORD_HEADER]); // 列が増えた場合に備えて見出しを更新
   if (!rec.isSheetHidden()) rec.hideSheet();
 }
 
@@ -662,7 +845,7 @@ function loadRecords_(ss) {
     if (!r[0]) return;
     map[r[0]] = {
       key: r[0], shiftId: r[1], target: r[2], calId: r[3], eventId: r[4], hash: r[5], status: r[6],
-      start: r[7] instanceof Date ? r[7].toISOString() : String(r[7] || ''), teamMemberId: r[8], guests: r[9], note: r[10],
+      start: asIso_(r[7]), teamMemberId: r[8], guests: r[9], note: r[10], locationId: r[12] || '', end: asIso_(r[13]),
     };
   });
   return map;
@@ -680,7 +863,7 @@ function saveRecords_(ss, records, now) {
     .sort(function (a, b) { return String(a.start).localeCompare(String(b.start)); })
     .map(function (r) {
       return [r.key, r.shiftId, r.target, r.calId || '', r.eventId || '', r.hash || '', r.status, "'" + (r.start || ''),
-        r.teamMemberId || '', r.guests || '', r.note || '', new Date()];
+        r.teamMemberId || '', r.guests || '', r.note || '', new Date(), r.locationId || '', "'" + (r.end || '')];
     });
   if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, RECORD_HEADER.length).clearContent();
   if (rows.length) sh.getRange(2, 1, rows.length, RECORD_HEADER.length).setValues(rows);
@@ -753,6 +936,10 @@ function merge_(a, b) {
 function hash_(value) {
   var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify(value), Utilities.Charset.UTF_8);
   return bytes.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
+}
+
+function asIso_(v) {
+  return v instanceof Date ? v.toISOString() : String(v || '');
 }
 
 function isChecked_(v) {
